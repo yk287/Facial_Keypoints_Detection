@@ -1,214 +1,71 @@
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 import torch
-import os
-import numpy as np
-import pandas as pd
-from skimage import io, transform
-from torch.utils.data import Dataset
-from PIL import Image
-from torchvision.transforms import RandomHorizontalFlip
-import torchvision.transforms as transforms
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-import cv2
 
+def show_all_keypoints(image, predicted_key_pts, gt_pts=None):
+    """Show image with predicted keypoints"""
+    # image is grayscale
+    plt.imshow(image, cmap='gray')
+    plt.scatter(predicted_key_pts[:, 0], predicted_key_pts[:, 1], s=20, marker='.', c='m')
+    # plot ground truth points as green pts
+    if gt_pts is not None:
+        plt.scatter(gt_pts[:, 0], gt_pts[:, 1], s=20, marker='.', c='g')
 
-import random
 
-class FaceLandmarksDataset(Dataset):
-    '''
-    Fac Landmarks Dataset
-    Inherits Dataset class and overrides 2 methods
+# visualize the output
+# by default this shows a batch of 10 images
+def visualize_output(test_images, test_outputs, gt_pts=None, batch_size=10):
+    for i in range(batch_size):
+        plt.figure(figsize=(10, 10))
+        ax = plt.subplot(1, batch_size, i + 1)
 
-    __len__ and __getitem__
-    '''
+        # un-transform the image data
+        image = test_images[i].data  # get the image from it's Variable wrapper
+        image = image.numpy()  # convert to numpy array from a Tensor
+        image = np.transpose(image, (1, 2, 0))  # transpose to go from torch to numpy image
 
+        # un-transform the predicted key_pts data
+        predicted_key_pts = test_outputs[i].data
+        predicted_key_pts = predicted_key_pts.numpy()
+        # undo normalization of keypoints
+        predicted_key_pts = predicted_key_pts * 50.0 + 100
 
-    def __init__(self, csv_file, root_dir, transform=None):
-        '''
+        # plot ground truth points for comparison, if they exist
+        ground_truth_pts = None
+        if gt_pts is not None:
+            ground_truth_pts = gt_pts[i]
+            ground_truth_pts = ground_truth_pts * 50.0 + 100
 
-        :param csv_file: Path to the csv file with annotations
-        :param root_dir: Directory with all the images
-        :param transform: Optional transform to be applied on a sample
-        '''
+        # call show_all_keypoints
+        show_all_keypoints(np.squeeze(image), predicted_key_pts, ground_truth_pts)
 
-        self.landmarks_frame = pd.read_csv(csv_file)
-        self.root_dir = root_dir
-        self.transform = transform
+        plt.axis('off')
 
-    def __len__(self):
-        return len(self.landmarks_frame)
+    plt.show()
 
-    def __getitem__(self, idx):
 
-        img_name = os.path.join(self.root_dir,
-                                self.landmarks_frame.iloc[idx, 0])
-        image = io.imread(img_name)
-        landmarks = self.landmarks_frame.iloc[idx, 1:].as_matrix()
-        landmarks = landmarks.astype('float').reshape(-1, 2)
+def net_sample_output(data_loader, model):
+    # iterate through the test dataset
+    for i, sample in enumerate(data_loader):
 
-        sample = {'image': image, 'landmarks': landmarks}
+        # get sample data: images and ground truth keypoints
+        images = sample['image']
+        key_pts = sample['keypoints']
 
-        if self.transform:
-            '''if transform is given transform the data'''
-            sample = self.transform(sample)
+        # convert images to FloatTensors
+        images = images.type(torch.FloatTensor).to(device)
 
-        return sample
+        # forward pass to get net output
+        model.eval()
+        with torch.no_grad():
+            output_pts = model(images)
 
-class Rescale(object):
-    """Rescale the image in a sample to a given size.
+        # reshape to batch_size x 68 x 2 pts
+        output_pts = output_pts.view(output_pts.size()[0], 68, -1)
 
-    Args:
-        output_size (tuple or int): Desired output size. If tuple, output is
-            matched to output_size. If int, smaller of image edges is matched
-            to output_size keeping aspect ratio the same.
-    """
-
-    def __init__(self, output_size):
-        assert isinstance(output_size, (int, tuple))
-        self.output_size = output_size
-
-    def __call__(self, sample):
-
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-
-        if isinstance(self.output_size, int):
-            if h > w:
-                new_h, new_w = self.output_size * h / w, self.output_size
-            else:
-                new_h, new_w = self.output_size, self.output_size * w / h
-        else:
-            new_h, new_w = self.output_size
-
-        new_h, new_w = int(new_h), int(new_w)
-
-        img = transform.resize(image, (new_h, new_w))
-
-        # h and w are swapped for landmarks because for images,
-        # x and y axes are axis 1 and 0 respectively
-        landmarks = landmarks * [new_w / w, new_h / h]
-
-        return {'image': img, 'landmarks': landmarks}
-
-class RandomCrop(object):
-    """Crop randomly the image in a sample.
-
-    Args:
-        output_size (tuple or int): Desired output size. If int, square crop
-            is made.
-    """
-
-    def __init__(self, output_size):
-        assert isinstance(output_size, (int, tuple))
-        if isinstance(output_size, int):
-            self.output_size = (output_size, output_size)
-        else:
-            assert len(output_size) == 2
-            self.output_size = output_size
-
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-        new_h, new_w = self.output_size
-
-        top = np.random.randint(0, h - new_h)
-        left = np.random.randint(0, w - new_w)
-
-        image = image[top: top + new_h,
-                      left: left + new_w]
-
-        landmarks = landmarks - [left, top]
-
-        return {'image': image, 'landmarks': landmarks}
-
-
-class ToTensor(object):
-    """Convert ndarrays in sample to Tensors."""
-
-    def __call__(self, sample):
-        image, landmarks = sample['image'], sample['landmarks']
-
-        # swap color axis because
-        # numpy image: H x W x C
-        # torch image: C X H X W
-        image = image.transpose((2, 0, 1))
-        return {'image': torch.from_numpy(image),
-                'landmarks': torch.from_numpy(landmarks)}
-
-
-class HorizontalFlip(object):
-    """Flips the image and the landmarks left to right with a given probability"""
-    def __init__(self, p=0.5):
-        assert isinstance(p, (int, float))
-        self.p = p
-
-    def __call__(self, sample):
-
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-
-        if random.random() < self.p:
-
-            image = cv2.flip(image, 1)
-            landmarks[:,0] = w - landmarks[:,0]
-
-        return {'image': image,
-                'landmarks': landmarks}
-
-class VerticalFlip(object):
-    """Flips the image and the landmarks over with a given probability"""
-    def __init__(self, p=0.5):
-        assert isinstance(p, (int, float))
-        self.p = p
-
-    def __call__(self, sample):
-
-        image, landmarks = sample['image'], sample['landmarks']
-
-        h, w = image.shape[:2]
-
-        if random.random() < self.p:
-
-            image = cv2.flip(image, 0)
-            landmarks[:, 1] = h - landmarks[:, 1]
-
-        return {'image': image,
-                'landmarks': landmarks}
-
-
-class RotateScale(object):
-    '''Rotate and scale up the image Using OpenCV's warpAffine() '''
-
-    def __init__(self, angle=45, scale =1):
-        '''
-
-        :param angle: rotation angle
-        :param scale: how much to scale up the image
-        '''
-
-        self.angle = angle
-        self.scale = scale
-
-    def __call__(self, sample):
-
-        image, landmarks = sample['image'], sample['landmarks']
-
-        cols, rows = image.shape[:2]
-
-        M = cv2.getRotationMatrix2D((cols / 2, rows / 2), self.angle, self.scale)
-        image = cv2.warpAffine(image, M, (cols, rows))
-
-        landmarks = np.matmul((np.array(np.concatenate((landmarks, np.ones(len(landmarks))[:, None]), axis=1))), M.transpose())
-
-        return {'image': image,
-                'landmarks': landmarks}
-
-
-
-
-
-
+        # break after first image is tested
+        if i == 0:
+            return images, output_pts, key_pts
